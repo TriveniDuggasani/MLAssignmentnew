@@ -1,323 +1,444 @@
 # app.py
 import io
+import sys
+import warnings
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import seaborn as sns
-import matplotlib.pyplot as plt
-
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    accuracy_score,
-    precision_recall_fscore_support,
-    classification_report,
-    confusion_matrix,
-    roc_auc_score,
-)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.datasets import load_iris
-
-# Models (6 total)
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.naive_bayes import GaussianNB
-from sklearn.tree import DecisionTreeClassifier
-
-
-# -----------------------------
-# App Title & Description
-# -----------------------------
-st.set_page_config(page_title="Simple ML Classifier", layout="wide")
-st.title("🔎 Simple Streamlit ML Classifier")
-st.caption(
-    "Upload a small CSV (test data), choose a model, and view evaluation metrics, "
-    "a confusion matrix, and a classification report."
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.metrics import (
+    accuracy_score,
+    roc_auc_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    matthews_corrcoef,
+    confusion_matrix,
+    classification_report,
 )
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB, MultinomialNB
+from sklearn.ensemble import RandomForestClassifier
 
-with st.sidebar:
-    st.header("🔧 Controls")
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-    # Upload CSV
-    uploaded = st.file_uploader(
-        "Upload CSV (small/test data recommended)",
-        type=["csv"],
-        help="For Streamlit free tier, keep it small (e.g., < ~5 MB).",
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ---- Try to import XGBoost gracefully ----
+HAS_XGB = True
+try:
+    from xgboost import XGBClassifier
+except Exception:
+    HAS_XGB = False
+
+# ----------------------------
+# Utility functions
+# ----------------------------
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Lowercase, strip, replace spaces and hyphens with underscores."""
+    df = df.copy()
+    df.columns = (
+        df.columns.str.strip()
+        .str.lower()
+        .str.replace(r"[ \-]+", "_", regex=True)
     )
-
-    # Optional demo dataset
-    use_demo = st.checkbox("Use demo dataset (Iris)", value=not bool(uploaded))
-
-    # Sampling to limit rows
-    sample_n = st.number_input(
-        "Sample rows (to keep it light)", min_value=50, max_value=10000, value=500, step=50,
-        help="If your dataset is larger, a random sample of this size will be used."
-    )
-
-    test_size = st.slider(
-        "Test size (%)", min_value=10, max_value=40, value=20, step=5
-    ) / 100.0
-
-    scale_numeric = st.checkbox("Scale numeric features", value=True)
-
-    random_state = st.number_input("Random state", min_value=0, value=42, step=1)
-
-    model_name = st.selectbox(
-        "Select model",
-        [
-            "Logistic Regression",
-            "SVM (RBF)",
-            "Random Forest",
-            "K-Nearest Neighbors",
-            "Gaussian Naive Bayes",
-            "Decision Tree",
-        ],
-    )
-
-    run_btn = st.button("▶️ Train & Evaluate", use_container_width=True)
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def load_demo_df() -> pd.DataFrame:
-    iris = load_iris(as_frame=True)
-    df = iris.frame.copy()
-    # Rename target for clarity
-    df.rename(columns={"target": "target"}, inplace=True)
     return df
 
+def find_target_column(df: pd.DataFrame) -> str:
+    """
+    Try to find the target column. We accept 'fetal_health' or any close variant
+    like 'fetal health', 'Fetal Health', case-insensitive.
+    """
+    candidates = {c: c.replace(" ", "_").lower() for c in df.columns}
+    for original, normalized in candidates.items():
+        if normalized == "fetal_health":
+            return original
+    # If not found, try fuzzy-ish search
+    for original, normalized in candidates.items():
+        if "fetal" in normalized and "health" in normalized:
+            return original
+    return ""
 
-def read_csv_safely(file) -> pd.DataFrame:
-    # Light validation: size check (approx)
-    if hasattr(file, "size") and file.size > 5 * 1024 * 1024:
-        st.warning("⚠️ File is larger than 5 MB. Please upload a smaller test file.")
-        return None
-    try:
-        df = pd.read_csv(file)
-        return df
-    except Exception as e:
-        st.error(f"Failed to read CSV: {e}")
-        return None
+def make_synthetic_fetal_health_dataframe(n=200, seed=42):
+    """
+    Create a synthetic fetal health-like dataset with several numeric features
+    and a multiclass target 'fetal_health' in {1,2,3}.
+    This is only for UI testing and demo purposes.
+    """
+    rng = np.random.default_rng(seed)
+    # 20 numeric features inspired by CTG-like structure (not exact)
+    cols = [
+        "baseline_value",
+        "accelerations",
+        "fetal_movement",
+        "uterine_contractions",
+        "light_decelerations",
+        "severe_decelerations",
+        "prolongued_decelerations",
+        "abnormal_short_term_variability",
+        "mean_value_of_short_term_variability",
+        "percentage_of_time_with_abnormal_long_term_variability",
+        "mean_value_of_long_term_variability",
+        "histogram_width",
+        "histogram_min",
+        "histogram_max",
+        "histogram_number_of_peaks",
+        "histogram_number_of_zeroes",
+        "histogram_mode",
+        "histogram_mean",
+        "histogram_median",
+        "histogram_variance",
+    ]
 
+    X = pd.DataFrame({
+        "baseline_value": rng.normal(120, 10, n),
+        "accelerations": rng.gamma(2.0, 0.5, n),
+        "fetal_movement": rng.poisson(3, n),
+        "uterine_contractions": rng.gamma(2.0, 0.8, n),
+        "light_decelerations": rng.poisson(2, n),
+        "severe_decelerations": rng.binomial(1, 0.1, n),
+        "prolongued_decelerations": rng.binomial(1, 0.05, n),
+        "abnormal_short_term_variability": rng.integers(0, 100, n),
+        "mean_value_of_short_term_variability": rng.uniform(0, 10, n),
+        "percentage_of_time_with_abnormal_long_term_variability": rng.uniform(0, 100, n),
+        "mean_value_of_long_term_variability": rng.uniform(0, 50, n),
+        "histogram_width": rng.uniform(10, 60, n),
+        "histogram_min": rng.integers(50, 120, n),
+        "histogram_max": rng.integers(120, 200, n),
+        "histogram_number_of_peaks": rng.integers(0, 10, n),
+        "histogram_number_of_zeroes": rng.integers(0, 20, n),
+        "histogram_mode": rng.integers(50, 200, n),
+        "histogram_mean": rng.uniform(80, 160, n),
+        "histogram_median": rng.uniform(80, 160, n),
+        "histogram_variance": rng.uniform(0, 50, n),
+    })
 
-def build_model(name: str, random_state: int):
-    if name == "Logistic Regression":
-        return LogisticRegression(max_iter=1000, class_weight="balanced")
-    elif name == "SVM (RBF)":
-        return SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=random_state)
-    elif name == "Random Forest":
-        return RandomForestClassifier(
-            n_estimators=200, random_state=random_state, class_weight="balanced"
-        )
-    elif name == "K-Nearest Neighbors":
-        return KNeighborsClassifier(n_neighbors=5)
-    elif name == "Gaussian Naive Bayes":
-        return GaussianNB()
-    elif name == "Decision Tree":
-        return DecisionTreeClassifier(random_state=random_state, class_weight="balanced")
+    # Create a 3-class target influenced by some features (purely synthetic)
+    risk_score = (
+        0.02 * (X["abnormal_short_term_variability"])
+        + 0.03 * (X["percentage_of_time_with_abnormal_long_term_variability"])
+        + 0.01 * (X["severe_decelerations"] * 100)
+        + 0.01 * (X["prolongued_decelerations"] * 100)
+        - 0.02 * X["accelerations"] * 10
+    )
+    # Quantiles define class boundaries 1 (normal), 2 (suspect), 3 (pathological)
+    q1, q2 = np.quantile(risk_score, [0.65, 0.85])
+    y = np.where(risk_score < q1, 1, np.where(risk_score < q2, 2, 3))
+
+    df = X.copy()
+    df["fetal_health"] = y
+    return df
+
+def load_dataframe_from_upload(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".xlsx"):
+        return pd.read_excel(uploaded_file, engine="openpyxl")
+    elif name.endswith(".xls"):
+        # Requires xlrd installed (supports .xls)
+        return pd.read_excel(uploaded_file, engine="xlrd")
+    elif name.endswith(".csv"):
+        return pd.read_csv(uploaded_file)
     else:
-        raise ValueError("Unknown model selected.")
+        raise ValueError("Unsupported file type. Please upload .xls, .xlsx, or .csv")
 
+def plot_confusion(y_true, y_pred, labels):
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=labels, yticklabels=labels, ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+    ax.set_title("Confusion Matrix")
+    st.pyplot(fig)
 
-def prepare_preprocessor(df: pd.DataFrame, target_col: str, scale_numeric: bool) -> ColumnTransformer:
-    X = df.drop(columns=[target_col])
-    # Identify types
-    numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
-
-    numeric_steps = []
-    # impute numeric
-    numeric_steps.append(("imputer", SimpleImputer(strategy="median")))
-    if scale_numeric:
-        numeric_steps.append(("scaler", StandardScaler()))
-
-    from sklearn.pipeline import Pipeline as SKPipeline
-    numeric_transformer = SKPipeline(steps=numeric_steps)
-
-    # impute + one-hot for categorical
-    # We use sparse=False for broad compatibility with GaussianNB and Streamlit plotting
-    categorical_transformer = SKPipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse=False)),
-        ]
-    )
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_transformer, numeric_cols),
-            ("cat", categorical_transformer, categorical_cols),
-        ],
-        remainder="drop",
-        verbose_feature_names_out=False,
-    )
-    return preprocessor
-
-
-def can_compute_proba(clf) -> bool:
-    # Some models support predict_proba()
-    return hasattr(clf, "predict_proba")
-
-
-def compute_metrics(y_true, y_pred, y_proba=None):
+def compute_metrics(y_true, y_pred, y_proba, average="weighted"):
     metrics = {}
-    metrics["accuracy"] = accuracy_score(y_true, y_pred)
-    p, r, f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="weighted", zero_division=0
-    )
-    metrics["precision_weighted"] = p
-    metrics["recall_weighted"] = r
-    metrics["f1_weighted"] = f1
+    metrics["Accuracy"] = accuracy_score(y_true, y_pred)
+    metrics["Precision"] = precision_score(y_true, y_pred, average=average, zero_division=0)
+    metrics["Recall"] = recall_score(y_true, y_pred, average=average, zero_division=0)
+    metrics["F1 Score"] = f1_score(y_true, y_pred, average=average, zero_division=0)
 
-    # Optional ROC-AUC (binary or multiclass)
-    # For multiclass, sklearn supports average='weighted' with label_binarize-like internal handling if predict_proba provided.
+    # MCC supports multiclass directly
+    metrics["MCC Score"] = matthews_corrcoef(y_true, y_pred)
+
+    # AUC (multiclass): requires probability estimates
     if y_proba is not None:
+        # Handle multiclass AUC
         try:
-            # For binary, y_proba is shape (n_samples, 2) -> use probas for class 1
-            if y_proba.shape[1] == 2:
-                auc = roc_auc_score(y_true, y_proba[:, 1])
-            else:
-                auc = roc_auc_score(y_true, y_proba, multi_class="ovr", average="weighted")
-            metrics["roc_auc"] = auc
+            metrics["AUC Score"] = roc_auc_score(
+                y_true, y_proba, multi_class="ovr", average=average
+            )
         except Exception:
-            metrics["roc_auc"] = np.nan
+            metrics["AUC Score"] = np.nan
+    else:
+        metrics["AUC Score"] = np.nan
 
     return metrics
 
+# ----------------------------
+# Streamlit UI
+# ----------------------------
 
-# -----------------------------
-# Load Data
-# -----------------------------
-df = None
-data_source = "demo" if use_demo or not uploaded else "uploaded"
+st.set_page_config(page_title="Fetal Health – Model Tester", layout="wide")
+st.title("🍼 Fetal Health – Model Tester")
 
-if data_source == "uploaded" and uploaded:
-    df = read_csv_safely(uploaded)
-elif use_demo:
-    df = load_demo_df()
-
-if df is None:
-    st.info("Upload a CSV or tick **Use demo dataset (Iris)** in the sidebar to begin.")
-    st.stop()
-
-# Sample to keep it light (if needed)
-if len(df) > sample_n:
-    df = df.sample(n=sample_n, random_state=random_state).reset_index(drop=True)
-
-st.success(f"Dataset loaded: {df.shape[0]} rows × {df.shape[1]} columns")
-with st.expander("👀 Preview data"):
-    st.dataframe(df.head(15), use_container_width=True)
-
-# -----------------------------
-# Target Column Selection
-# -----------------------------
-# Heuristic: if a column named 'target' exists, preselect it.
-candidate_target = "target" if "target" in df.columns else df.columns[-1]
-target_col = st.selectbox(
-    "Select target column (classification label)",
-    options=df.columns.tolist(),
-    index=df.columns.tolist().index(candidate_target) if candidate_target in df.columns else 0,
+st.markdown(
+    """
+Use this app to **download sample data**, **upload your dataset**, **select a model**, and **see evaluation metrics**.
+**Target column must be named** `fetal_health` (case/space-insensitive).  
+**Note:** The sample dataset is *synthetic* (for demo/testing the UI only).
+"""
 )
 
-# Remove missing target rows
-df = df.dropna(subset=[target_col])
-y = df[target_col]
-X = df.drop(columns=[target_col])
+with st.sidebar:
+    st.header("1) Get Sample Data")
+    st.caption("Synthetic demo data with `fetal_health` as the target.")
+    df_sample = make_synthetic_fetal_health_dataframe(n=200, seed=42)
 
-# Guard: target should be categorical/discrete-ish
-if y.nunique() > max(50, int(0.2 * len(y))):
-    st.warning(
-        f"⚠️ The selected target '{target_col}' has {y.nunique()} unique values. "
-        "This might be regression-like or too granular for a simple classifier."
+    # Offer .xlsx for download
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df_sample.to_excel(writer, index=False, sheet_name="fetal_health_sample")
+    st.download_button(
+        label="⬇️ Download sample (.xlsx)",
+        data=buffer.getvalue(),
+        file_name="fetal_health_sample.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-# -----------------------------
-# Train & Evaluate
-# -----------------------------
-if run_btn:
-    with st.spinner("Training and evaluating..."):
-        # Split
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y if y.nunique() > 1 else None
+    st.header("2) Settings")
+    test_size = st.slider("Test size (validation split)", 0.1, 0.5, 0.2, 0.05)
+    seed = st.number_input("Random seed", min_value=0, value=42, step=1)
+
+    model_names = [
+        "Logistic Regression",
+        "Decision Tree Classifier",
+        "K-Nearest Neighbor Classifier",
+        "Naive Bayes Classifier",
+        "Ensemble: Random Forest",
+    ]
+    if HAS_XGB:
+        model_names.append("Ensemble: XGBoost")
+    else:
+        st.info("ℹ️ XGBoost not installed. To enable: `pip install xgboost`")
+
+    selected_model = st.selectbox("3) Select a model", model_names, index=0)
+
+    nb_variant = None
+    if selected_model == "Naive Bayes Classifier":
+        nb_variant = st.radio(
+            "Naive Bayes variant",
+            ["Gaussian", "Multinomial"],
+            index=0,
+            horizontal=True,
+            help="GaussianNB for continuous features; MultinomialNB for count-like, non-negative features",
         )
 
-        # Build preprocessor and model
-        preprocessor = prepare_preprocessor(df, target_col, scale_numeric)
-        model = build_model(model_name, random_state=random_state)
+    show_which = st.radio(
+        "Show analysis",
+        ["Confusion Matrix", "Classification Report"],
+        index=0,
+        horizontal=True,
+    )
 
-        # Full pipeline
-        clf = Pipeline(steps=[("preprocess", preprocessor), ("model", model)])
-        clf.fit(X_train, y_train)
+st.header("3) Upload Your Data")
+uploaded = st.file_uploader(
+    "Upload .xls / .xlsx (or .csv) file containing features and a `fetal_health` target column.",
+    type=["xls", "xlsx", "csv"],
+)
 
-        # Predict
-        y_pred = clf.predict(X_test)
-
-        # Probabilities (if available)
-        y_proba = None
-        if can_compute_proba(clf.named_steps["model"]):
-            try:
-                y_proba = clf.predict_proba(X_test)
-            except Exception:
-                y_proba = None
-
-        # Metrics
-        m = compute_metrics(y_test, y_pred, y_proba)
-
-        # -----------------------------
-        # Display Metrics
-        # -----------------------------
-        st.subheader("📊 Evaluation Metrics")
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Accuracy", f"{m['accuracy']:.3f}")
-        col2.metric("Precision (weighted)", f"{m['precision_weighted']:.3f}")
-        col3.metric("Recall (weighted)", f"{m['recall_weighted']:.3f}")
-        col4.metric("F1 (weighted)", f"{m['f1_weighted']:.3f}")
-        if "roc_auc" in m and m["roc_auc"] == m["roc_auc"]:  # not NaN
-            col5.metric("ROC-AUC", f"{m['roc_auc']:.3f}")
-        else:
-            col5.metric("ROC-AUC", "N/A")
-
-        # Classification report
-        report_dict = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
-        report_df = pd.DataFrame(report_dict).T
-        # Beautify
-        st.subheader("🧾 Classification Report")
-        st.dataframe(
-            report_df.style.format(precision=3).background_gradient(cmap="Blues"), 
-            use_container_width=True
-        )
-
-        # Confusion matrix
-        st.subheader("🧩 Confusion Matrix")
-        labels = sorted(y.unique())
-        cm = confusion_matrix(y_test, y_pred, labels=labels)
-        fig, ax = plt.subplots(figsize=(6, 5))
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, ax=ax,
-                    xticklabels=labels, yticklabels=labels)
-        ax.set_xlabel("Predicted")
-        ax.set_ylabel("Actual")
-        ax.set_title(f"Confusion Matrix — {model_name}")
-        st.pyplot(fig, clear_figure=True)
-
-        st.success("Done ✅")
+if uploaded is not None:
+    try:
+        df = load_dataframe_from_upload(uploaded)
+    except Exception as ex:
+        st.error(f"Could not read file: {ex}")
+        st.stop()
 else:
-    st.info("Set options in the sidebar and click **Train & Evaluate**.")
+    st.warning("Upload a dataset to proceed, or download the sample from the sidebar.")
+    st.stop()
 
+# Normalize columns and locate target
+df = normalize_columns(df)
+target_col = find_target_column(df)
+if not target_col:
+    st.error("Target column `fetal_health` not found. Please include it in your file.")
+    st.stop()
 
-# -----------------------------
-# Notes Section
-# -----------------------------
-with st.expander("ℹ️ Notes & Tips"):
-    st.markdown(
-        """
-- For small/test data, metrics can vary significantly with different train-test splits.
-- **Class imbalance**: Models using `class_weight='balanced'` (Logistic Regression, SVM, Random Forest, Decision Tree) may help.
-- If your dataset has many categories, one-hot encoding can expand features quickly. Keep data **small** on free tier.
-- This app supports **multiclass** problems (Iris demo is 3-class).
-"""
+# Basic sanity
+if df[target_col].isna().any():
+    st.warning("Missing values detected in the target column; dropping such rows.")
+    df = df[~df[target_col].isna()]
+if df.shape[0] < 20:
+    st.warning("Very few rows after cleaning; metrics may be unstable.")
+
+# Separate features and target
+X = df.drop(columns=[target_col])
+y = df[target_col]
+
+# Attempt to coerce numeric types in X
+for c in X.columns:
+    if not pd.api.types.is_numeric_dtype(X[c]):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+
+# Drop rows with all-NaN features
+all_nan = X.isna().all(axis=1)
+if all_nan.any():
+    st.warning(f"Dropping {all_nan.sum()} rows with all-NaN features.")
+    X = X.loc[~all_nan]
+    y = y.loc[~all_nan]
+
+# Train/validation split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=test_size, random_state=seed, stratify=y if y.nunique() > 1 else None
+)
+
+# Build model pipeline
+numeric_features = X.columns.tolist()
+
+def build_pipeline(name: str):
+    if name == "Logistic Regression":
+        clf = LogisticRegression(max_iter=2000, n_jobs=None)
+        steps = [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("clf", clf),
+        ]
+        return Pipeline(steps)
+
+    if name == "Decision Tree Classifier":
+        clf = DecisionTreeClassifier(random_state=seed)
+        steps = [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf", clf),
+        ]
+        return Pipeline(steps)
+
+    if name == "K-Nearest Neighbor Classifier":
+        clf = KNeighborsClassifier(n_neighbors=5)
+        steps = [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("clf", clf),
+        ]
+        return Pipeline(steps)
+
+    if name == "Naive Bayes Classifier":
+        if nb_variant == "Multinomial":
+            # MultinomialNB requires non-negative features; scale to [0,1]
+            clf = MultinomialNB()
+            steps = [
+                ("imputer", SimpleImputer(strategy="median")),
+                ("nonneg", MinMaxScaler()),  # ensures non-negative inputs
+                ("clf", clf),
+            ]
+        else:
+            clf = GaussianNB()
+            steps = [
+                ("imputer", SimpleImputer(strategy="mean")),
+                ("clf", clf),
+            ]
+        return Pipeline(steps)
+
+    if name == "Ensemble: Random Forest":
+        clf = RandomForestClassifier(
+            n_estimators=300,
+            random_state=seed,
+            n_jobs=-1,
+            class_weight="balanced_subsample",
+        )
+        steps = [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf", clf),
+        ]
+        return Pipeline(steps)
+
+    if name == "Ensemble: XGBoost" and HAS_XGB:
+        clf = XGBClassifier(
+            n_estimators=400,
+            learning_rate=0.05,
+            max_depth=5,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=seed,
+            eval_metric="mlogloss",
+            tree_method="hist",
+            nthread=-1,
+        )
+        steps = [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf", clf),
+        ]
+        return Pipeline(steps)
+
+    raise ValueError("Unknown model selected or dependency missing.")
+
+# Train and evaluate
+try:
+    model = build_pipeline(selected_model)
+except Exception as ex:
+    st.error(f"Could not build model: {ex}")
+    st.stop()
+
+with st.spinner("Training and evaluating..."):
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    # Probability estimates (if available)
+    y_proba = None
+    if hasattr(model.named_steps["clf"], "predict_proba"):
+        try:
+            y_proba = model.predict_proba(X_test)
+        except Exception:
+            y_proba = None
+
+# Metrics
+metrics = compute_metrics(y_test, y_pred, y_proba, average="weighted")
+metrics_df = pd.DataFrame(
+    {
+        "Metric": list(metrics.keys()),
+        "Score": [None if np.isnan(v) else float(v) for v in metrics.values()],
+    }
+)
+
+left, right = st.columns([1, 1])
+with left:
+    st.subheader("Evaluation Metrics")
+    st.dataframe(
+        metrics_df.style.format({"Score": "{:.4f}"}), use_container_width=True
     )
+
+with right:
+    st.subheader("Class Distribution (Test Set)")
+    st.bar_chart(y_test.value_counts().sort_index(), use_container_width=True)
+
+# Confusion matrix or classification report
+st.subheader("Model Diagnostics")
+labels_sorted = sorted(y.unique())
+
+if show_which == "Confusion Matrix":
+    plot_confusion(y_test, y_pred, labels_sorted)
+else:
+    report = classification_report(y_test, y_pred, digits=4)
+    st.text(report)
+
+# Helpful tips
+st.markdown(
+    """
+**Tips**
+- Ensure your file has a `fetal_health` target column (values typically 1, 2, 3).
+- All other columns should be numeric features. Non-numeric columns will be coerced; rows with all-NaN features are dropped.
+- For **MultinomialNB**, features are scaled to [0,1] to satisfy non-negativity.
+- AUC is computed using multiclass One-vs-Rest with weighted averaging when probabilities are available.
+"""
+)
