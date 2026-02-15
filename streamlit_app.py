@@ -284,6 +284,14 @@ if df.shape[0] < 20:
 X = df.drop(columns=[target_col])
 y = df[target_col]
 
+# Shift labels from {1,2,3} to {0,1,2} for multi-class compatibility
+try:
+    y = y.astype(int)
+    if set(y.unique()).issubset({1, 2, 3}):
+        y = y - 1
+except:
+    pass
+
 # Attempt to coerce numeric types in X
 for c in X.columns:
     if not pd.api.types.is_numeric_dtype(X[c]):
